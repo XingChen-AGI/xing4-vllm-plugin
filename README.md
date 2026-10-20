@@ -201,7 +201,7 @@ and complete reasoning/tool-call extractions.
 ## Project layout
 
 ```
-xing4-plugin/
+xing4-vllm-plugin/
 +-- src/vllm_xing4_0_plugin/
 |   +-- __init__.py                  # register() and patch entry point
 |   +-- xing4_0.py                    # vendored Xing4_0 model
