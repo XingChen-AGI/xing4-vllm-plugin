@@ -52,6 +52,7 @@ from vllm.model_executor.models.deepseek_v2 import (
     DeepseekV2MoE,
 )
 from vllm.model_executor.models.utils import (
+    AutoWeightsLoader,
     PPMissingLayer,
     make_empty_intermediate_tensors_factory,
     make_layers,
@@ -117,6 +118,68 @@ def _xing4_0_ensure_contiguous(x: torch.Tensor) -> torch.Tensor:
 # ============================== mHC adapter ==============================
 
 
+def get_hc_multi(config) -> int:
+    """Number of mHC residual streams.
+
+    DSA checkpoints store this as ``num_residual_streams``. Xing4 configs
+    use ``hc_mult``. ``num_residual_streams`` is read first.
+    """
+    n = getattr(config, "num_residual_streams", None)
+    if n is None:
+        n = getattr(config, "hc_mult", 1)
+    if n is None:
+        return 1
+    return int(n)
+
+
+def _remap_xing4_hc_weights(
+    weights: Iterable[tuple[str, torch.Tensor]],
+) -> list[tuple[str, torch.Tensor]]:
+    """Map training mHC names onto the shared op parameters.
+
+    mapping_weight (n^2+2n, n*C) -> hc_fn
+    alpha_pre, alpha_post, alpha_res -> hc_scale (3,)
+    bias (n^2+2n,) -> hc_base
+    rms_weight is an all-ones RMS gamma; the op does not take it.
+    """
+    alphas: dict[str, dict[int, torch.Tensor]] = {}
+    remapped: list[tuple[str, torch.Tensor]] = []
+    for name, tensor in weights:
+        if name.endswith("alpha_pre") and ("attn_hc" in name or "ffn_hc" in name):
+            alphas.setdefault(name[: -len("alpha_pre")], {})[0] = tensor
+        elif name.endswith("alpha_post") and ("attn_hc" in name or "ffn_hc" in name):
+            alphas.setdefault(name[: -len("alpha_post")], {})[1] = tensor
+        elif name.endswith("alpha_res") and ("attn_hc" in name or "ffn_hc" in name):
+            alphas.setdefault(name[: -len("alpha_res")], {})[2] = tensor
+        elif name.endswith("mapping_weight") and (
+            "attn_hc" in name or "ffn_hc" in name
+        ):
+            remapped.append((name.replace("mapping_weight", "hc_fn"), tensor))
+        elif name.endswith(".bias") and ("attn_hc" in name or "ffn_hc" in name):
+            remapped.append((name.replace(".bias", ".hc_base"), tensor))
+        elif name.endswith("rms_weight") and ("attn_hc" in name or "ffn_hc" in name):
+            continue
+        else:
+            remapped.append((name, tensor))
+    for prefix, group in alphas.items():
+        if 0 in group and 1 in group and 2 in group:
+            scale = torch.stack(
+                [group[i].reshape(()).to(dtype=torch.float32) for i in range(3)]
+            )
+            remapped.append((f"{prefix}hc_scale", scale))
+        else:
+            logger.warning(
+                "xing4_0: incomplete alpha group %s keys=%s", prefix, sorted(group)
+            )
+    return remapped
+
+
+def _strip_model_prefix(name: str) -> str:
+    return name[len("model.") :] if name.startswith("model.") else name
+
+
+
+
 class Xing4_0MHC(nn.Module):
     """mHC (Manifold-constrained Hyper-Connections) wrapper.
 
@@ -130,10 +193,8 @@ class Xing4_0MHC(nn.Module):
 
     def __init__(self, config) -> None:
         super().__init__()
-        # ``hc_mult`` (a.k.a. num_residual_streams on older checkpoints) is the
-        # number of parallel mHC streams; <=1 disables mHC and falls back to the
-        # standard DeepseekV2 residual path.
-        self.n = getattr(config, "hc_mult", 1)
+        # <=1 disables mHC and falls back to the standard DeepseekV2 residual.
+        self.n = get_hc_multi(config)
         self.hidden_size = config.hidden_size
         self.sinkhorn_iterations = getattr(config, "hc_sinkhorn_iters", 20)
         self.norm_eps = getattr(config, "hc_eps", 1e-6)
@@ -343,7 +404,7 @@ class Xing4_0DecoderLayer(nn.Module):
         )
         self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
 
-        self.n = getattr(config, "hc_mult", 1)
+        self.n = get_hc_multi(config)
         self.enable_mhc = self.n > 1
         if self.enable_mhc:
             self.attn_hc = Xing4_0MHC(config)
@@ -448,6 +509,11 @@ class Xing4_0Model(nn.Module):
         self.config = config
         self.device = current_platform.device_type
 
+        # Resolve before layers are built. MHC modules read the same value.
+        n_streams = get_hc_multi(config)
+        config.hc_mult = n_streams
+        config.num_residual_streams = n_streams
+
         # Backward compatibility: older Xing4_0 configs describe RoPE with
         # `rope_scaling` while vLLM's DeepSeek attention expects
         # `rope_parameters`. TODO: drop this once the released config.json
@@ -543,7 +609,7 @@ class Xing4_0Model(nn.Module):
         self.num_redundant_experts = (
             vllm_config.parallel_config.eplb_config.num_redundant_experts
         )
-        self.num_residual_streams = getattr(config, "hc_mult", 1)
+        self.num_residual_streams = get_hc_multi(config)
 
         if self.num_residual_streams > 1:
             # The shared mHC ops assert bfloat16 inputs (they were built for
@@ -637,16 +703,17 @@ class Xing4_0Model(nn.Module):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load Xing4_0 weights.
 
-        The mHC weights (``{attn,ffn}_hc.*``) live on the ``Xing4_0MHC``
-        modules, which the DeepseekV2 loader does not know about, so load
-        them directly here and delegate everything else to
-        ``DeepseekV2Model.load_weights``.
+        Training checkpoints store mHC as ``mapping_weight`` / ``alpha_*`` /
+        ``bias`` / ``rms_weight``. The shared MHC op consumes ``hc_fn`` /
+        ``hc_scale`` / ``hc_base``. ``rms_weight`` is dropped. Everything else
+        goes to the DeepSeek loader.
         """
         params_dict = dict(self.named_parameters())
+        remapped = _remap_xing4_hc_weights(weights)
 
         hc_weights = []
         other_weights = []
-        for name, loaded_weight in weights:
+        for name, loaded_weight in remapped:
             if "attn_hc" in name or "ffn_hc" in name:
                 hc_weights.append((name, loaded_weight))
             else:
@@ -654,13 +721,18 @@ class Xing4_0Model(nn.Module):
 
         loaded_params: set[str] = set()
         for name, loaded_weight in hc_weights:
-            if name not in params_dict:
+            lookup = _strip_model_prefix(name)
+            if lookup not in params_dict:
+                logger.warning("xing4_0: skip hc weight %s", name)
                 continue
-            param = params_dict[name]
+            param = params_dict[lookup]
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, loaded_weight)
-            loaded_params.add(name)
+            loaded_params.add(lookup)
 
+        other_weights = [
+            (_strip_model_prefix(name), tensor) for name, tensor in other_weights
+        ]
         loaded_params.update(DeepseekV2Model.load_weights(self, other_weights))
         return loaded_params
 
@@ -673,6 +745,13 @@ class Xing4_0ForCausalLM(DeepseekV2ForCausalLM):
     packed_modules_mapping = {
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        # AutoWeightsLoader sends model.* into Xing4_0Model.load_weights and
+        # loads lm_head itself. ParallelLMHead.weight_loader shards the vocab
+        # dimension under tensor parallelism. A direct copy does not.
+        loader = AutoWeightsLoader(self)
+        return loader.load_weights(_remap_xing4_hc_weights(weights))
 
     def set_moe_parameters(self):
         """Override for Xing4_0DecoderLayer (not a DeepseekV2DecoderLayer
