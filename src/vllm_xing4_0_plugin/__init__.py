@@ -80,16 +80,25 @@ def _register_tool_parser() -> None:
     )
 
 
-def hf_config_override_xing4_0(hf_config):
+def hf_config_override_xing4_0(hf_config, *args, **kwargs):
     """Wrap ``SpeculativeConfig.hf_config_override`` for Xing4_0 MTP drafts.
 
     Xing4_0 MTP draft checkpoints keep ``model_type: "xing4_0"``; remap them
     to the DeepSeek MTP path and delegate, so vLLM derives ``n_predict`` and
     the ``DeepSeekMTPModel`` architecture as for DeepSeek-V3.
+
+    Newer vLLM (e.g. 0.34.x) passes a second ``transformers_mtp_overrides``
+    argument, either positionally or as a keyword (and may bind it with
+    ``functools.partial``). Accept and forward it verbatim; when it is set,
+    vLLM's own override applies those keys and returns early, so the
+    ``xing4_0`` -> ``deepseek_mtp`` remap must be skipped.
     """
     from vllm.config.speculative import SpeculativeConfig
 
-    if getattr(hf_config, "model_type", None) == PARSER_NAME:
+    mtp_overrides = kwargs.get("transformers_mtp_overrides", None)
+    if mtp_overrides is None and args:
+        mtp_overrides = args[0]
+    if mtp_overrides is None and getattr(hf_config, "model_type", None) == PARSER_NAME:
         hf_config.model_type = "deepseek_mtp"
 
     orig = _ORIG_HF_CONFIG_OVERRIDE
@@ -99,6 +108,12 @@ def hf_config_override_xing4_0(hf_config):
         # in place, so resolve it from the class dict.
         orig = SpeculativeConfig.__dict__["hf_config_override"]
         orig = getattr(orig, "__func__", orig)
+    if args:
+        return orig(hf_config, *args)
+    if kwargs:
+        # Forward positionally: the parameter name is stable today but the
+        # wrapper should not depend on it.
+        return orig(hf_config, kwargs.get("transformers_mtp_overrides"))
     return orig(hf_config)
 
 
