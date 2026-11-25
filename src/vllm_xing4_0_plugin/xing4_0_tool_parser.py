@@ -3,6 +3,7 @@
 
 import ast
 import json
+import os
 import re
 from collections.abc import Mapping, Sequence
 from typing import Any
@@ -31,6 +32,17 @@ from vllm.tool_parsers.abstract_tool_parser import (
 )
 
 logger = init_logger(__name__)
+
+# When enabled, tool calls whose function name is not in the request's tools
+# list are still returned to the client instead of being skipped.
+FORWARD_UNKNOWN_TOOLS_ENV = "XING4_0_FORWARD_UNKNOWN_TOOLS"
+
+_TRUE = frozenset({"1", "true", "yes", "on"})
+
+
+def _forward_unknown_tools() -> bool:
+    return os.environ.get(FORWARD_UNKNOWN_TOOLS_ENV, "").strip().lower() in _TRUE
+
 
 TOOL_START_TOKEN = "<tool_call>"
 TOOL_END_TOKEN = "</tool_call>"
@@ -156,6 +168,9 @@ def _split_payload(
             name = parsed.get("name")
             if isinstance(name, str) and name:
                 return name, "", payload
+            if "name" in parsed:
+                # An explicit but empty name is never a callable tool.
+                return "", "", payload
 
     for tool_name in _iter_tool_names(tools):
         if payload == tool_name:
@@ -221,12 +236,19 @@ class Xing4_0ToolParser(ToolParser):
     ) -> ExtractedToolCallInformation:
         logger.debug("model_output: %s", model_output)
 
+        tool_indices = set(_iter_tool_names(request.tools))
         tool_calls: list[ToolCall] = []
         try:
             for match in TOOL_CALL_REGEX.finditer(model_output):
                 tool_name, arguments = _parse_payload(match.group(1), request.tools)
                 if not tool_name:
                     continue
+                if tool_name not in tool_indices:
+                    logger.warning(
+                        "Model attempted to call undefined function: %s", tool_name
+                    )
+                    if not _forward_unknown_tools():
+                        continue
 
                 tool_calls.append(
                     ToolCall(
@@ -308,8 +330,10 @@ class Xing4_0ToolParser(ToolParser):
             extracted_tool_calls = self.extract_tool_calls(tool_text, request)
 
             if not extracted_tool_calls.tool_calls:
-                logger.warning("Failed to extract any tool calls from %r.", tool_text)
-                content += tool_text
+                # The block produced no usable call (unknown function with
+                # forwarding disabled, or an empty name). Drain it so it
+                # neither leaks into the content nor breaks later parsing.
+                logger.debug("Drained tool call block: %r", tool_text)
             else:
                 for tool_call in extracted_tool_calls.tool_calls:
                     self.current_tool_id += 1
