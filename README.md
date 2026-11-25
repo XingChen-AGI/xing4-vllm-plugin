@@ -147,6 +147,12 @@ func
 Values declared as integer/number/boolean/JSON in the tool schema are
 converted to their JSON types; string-typed values are kept verbatim.
 
+By default a call whose function name is not present in the request's `tools`
+list is skipped (with a warning). Set `XING4_0_FORWARD_UNKNOWN_TOOLS=1` to
+forward such calls to the client with their parsed arguments instead. Calls
+with an empty function name are always skipped, in both streaming and
+non-streaming responses.
+
 ## Plugin loading and allowlists
 
 General plugins are loaded automatically by vLLM unless `VLLM_PLUGINS` is set

@@ -25,6 +25,7 @@ from vllm_xing4_0_plugin.xing4_0_reasoning_parser import (
     Xing4_0ReasoningParser,
 )
 from vllm_xing4_0_plugin.xing4_0_tool_parser import (
+    FORWARD_UNKNOWN_TOOLS_ENV,
     TOOL_END_TOKEN,
     TOOL_START_TOKEN,
     Xing4_0ToolParser,
@@ -210,6 +211,105 @@ def test_tool_parser_no_tool_call():
     result = parser.extract_tool_calls("plain answer", _chat_request())
     assert not result.tools_called
     assert result.content == "plain answer"
+
+
+def _unknown_tool_output(name="delete_everything"):
+    return (
+        TOOL_START_TOKEN
+        + json.dumps({"name": name, "arguments": {"city": "Paris"}})
+        + TOOL_END_TOKEN
+    )
+
+
+def test_tool_parser_unknown_tool_skipped_by_default(monkeypatch):
+    monkeypatch.delenv(FORWARD_UNKNOWN_TOOLS_ENV, raising=False)
+    parser = Xing4_0ToolParser(FakeTokenizer())
+    result = parser.extract_tool_calls(_unknown_tool_output(), _chat_request())
+    assert not result.tools_called
+    assert result.tool_calls == []
+
+
+def test_tool_parser_unknown_tool_forwarded_when_enabled(monkeypatch):
+    monkeypatch.setenv(FORWARD_UNKNOWN_TOOLS_ENV, "1")
+    parser = Xing4_0ToolParser(FakeTokenizer())
+    result = parser.extract_tool_calls(_unknown_tool_output(), _chat_request())
+    assert result.tools_called
+    assert len(result.tool_calls) == 1
+    call = result.tool_calls[0]
+    assert call.function.name == "delete_everything"
+    assert json.loads(call.function.arguments) == {"city": "Paris"}
+
+
+def test_tool_parser_empty_name_skipped_in_both_modes(monkeypatch):
+    for enabled in (False, True):
+        if enabled:
+            monkeypatch.setenv(FORWARD_UNKNOWN_TOOLS_ENV, "1")
+        else:
+            monkeypatch.delenv(FORWARD_UNKNOWN_TOOLS_ENV, raising=False)
+        parser = Xing4_0ToolParser(FakeTokenizer())
+        output = (
+            TOOL_START_TOKEN
+            + json.dumps({"name": "", "arguments": {"city": "Paris"}})
+            + TOOL_END_TOKEN
+        )
+        result = parser.extract_tool_calls(output, _chat_request())
+        assert not result.tools_called
+        assert result.tool_calls == []
+
+
+def test_tool_parser_streaming_drains_skipped_unknown_tool(monkeypatch):
+    monkeypatch.delenv(FORWARD_UNKNOWN_TOOLS_ENV, raising=False)
+    parser = Xing4_0ToolParser(FakeTokenizer())
+    output = "answer " + _unknown_tool_output() + "done"
+    result = parser.extract_tool_calls_streaming(
+        previous_text="",
+        current_text=output,
+        delta_text=output,
+        previous_token_ids=[],
+        current_token_ids=[],
+        delta_token_ids=[],
+        request=_chat_request(),
+    )
+    assert result is not None
+    assert not result.tool_calls
+    # The skipped call is drained, not leaked into the content.
+    assert result.content == "answer done"
+
+
+def test_tool_parser_streaming_drains_empty_name(monkeypatch):
+    monkeypatch.setenv(FORWARD_UNKNOWN_TOOLS_ENV, "1")
+    parser = Xing4_0ToolParser(FakeTokenizer())
+    output = TOOL_START_TOKEN + json.dumps({"name": "", "arguments": {}}) + TOOL_END_TOKEN
+    result = parser.extract_tool_calls_streaming(
+        previous_text="",
+        current_text=output,
+        delta_text=output,
+        previous_token_ids=[],
+        current_token_ids=[],
+        delta_token_ids=[],
+        request=_chat_request(),
+    )
+    # Empty-name calls are drained even when the switch is on.
+    assert result is None
+
+
+def test_tool_parser_streaming_forwards_unknown_tool_when_enabled(monkeypatch):
+    monkeypatch.setenv(FORWARD_UNKNOWN_TOOLS_ENV, "1")
+    parser = Xing4_0ToolParser(FakeTokenizer())
+    output = _unknown_tool_output()
+    result = parser.extract_tool_calls_streaming(
+        previous_text="",
+        current_text=output,
+        delta_text=output,
+        previous_token_ids=[],
+        current_token_ids=[],
+        delta_token_ids=[],
+        request=_chat_request(),
+    )
+    assert result is not None
+    assert len(result.tool_calls) == 1
+    assert result.tool_calls[0].function.name == "delete_everything"
+    assert json.loads(result.tool_calls[0].function.arguments) == {"city": "Paris"}
 
 
 def test_reasoning_parser_extraction():
