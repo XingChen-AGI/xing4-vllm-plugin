@@ -82,6 +82,55 @@ def test_parsers_registered_under_both_names():
         ), name
 
 
+def _init_fake_serving_chat(monkeypatch, reasoning_parser, defaults=None):
+    serving = SimpleNamespace()
+
+    def original_init(self, *args, **kwargs):
+        # Current vLLM keeps separate dictionaries when the CLI default is
+        # empty, so use separate copies here as well.
+        self.default_chat_template_kwargs = dict(defaults or {})
+        self.online_renderer = SimpleNamespace(
+            default_chat_template_kwargs=dict(defaults or {})
+        )
+
+    monkeypatch.setattr(xing4_1, "_ORIG_SERVING_CHAT_INIT", original_init)
+    xing4_1._serving_chat_init_xing4_1(
+        serving,
+        reasoning_parser=reasoning_parser,
+    )
+    return serving
+
+
+@pytest.mark.parametrize("parser_name", [PARSER_NAME, PARSER_ALIAS])
+def test_serving_chat_enables_thinking_by_default(monkeypatch, parser_name):
+    serving = _init_fake_serving_chat(monkeypatch, parser_name)
+
+    assert serving.default_chat_template_kwargs["enable_thinking"] is True
+    assert serving.online_renderer.default_chat_template_kwargs[
+        "enable_thinking"
+    ] is True
+
+
+def test_serving_chat_preserves_explicit_server_default(monkeypatch):
+    serving = _init_fake_serving_chat(
+        monkeypatch,
+        PARSER_NAME,
+        defaults={"enable_thinking": False},
+    )
+
+    assert serving.default_chat_template_kwargs["enable_thinking"] is False
+    assert serving.online_renderer.default_chat_template_kwargs[
+        "enable_thinking"
+    ] is False
+
+
+def test_serving_chat_leaves_other_reasoning_parsers_unchanged(monkeypatch):
+    serving = _init_fake_serving_chat(monkeypatch, "deepseek_r1")
+
+    assert serving.default_chat_template_kwargs == {}
+    assert serving.online_renderer.default_chat_template_kwargs == {}
+
+
 def _convertor(model_type, **text_attrs):
     from vllm.transformers_utils.model_arch_config_convertor import (
         ModelArchConfigConvertorBase,

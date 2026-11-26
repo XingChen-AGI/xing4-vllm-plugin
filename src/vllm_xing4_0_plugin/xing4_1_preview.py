@@ -16,6 +16,8 @@ support above:
   emits the same sentinel-tagged formats);
 - MLA recognition in the model-arch convertor (``ModelConfig.use_mla``);
 - MTP draft remapping in ``SpeculativeConfig.hf_config_override``;
+- thinking enabled by default for the Xing-family reasoning parsers, with
+  server- and request-level overrides preserved;
 - query-only RoPE support on ``DeepseekScalingRotaryEmbedding.forward_cuda``
   for the DSA indexer path.
 
@@ -77,6 +79,7 @@ _TRUE = frozenset({"1", "true", "yes", "on"})
 _ORIG_HF_CONFIG_OVERRIDE = None
 _ORIG_IS_DEEPSEEK_MLA = None
 _ORIG_ROPE_FORWARD_CUDA = None
+_ORIG_SERVING_CHAT_INIT = None
 
 
 def _known_model_types() -> "frozenset[str]":
@@ -276,6 +279,53 @@ def _query_only_rope_forward_cuda(self, positions, query, key=None, offsets=None
 _query_only_rope_forward_cuda._xing4_1_patch = True
 
 
+def _serving_chat_init_xing4_1(self, *args, **kwargs):
+    """Enable thinking before vLLM renders the chat template.
+
+    ``ReasoningParser.adjust_request`` runs after template rendering, so the
+    default must be installed on the serving objects instead. Both objects
+    are updated because current vLLM keeps separate default dictionaries on
+    ``OpenAIServingChat`` and ``OnlineRenderer``. ``setdefault`` preserves an
+    explicit server default, and request-level kwargs retain their normal
+    higher priority.
+    """
+    _ORIG_SERVING_CHAT_INIT(self, *args, **kwargs)
+    if kwargs.get("reasoning_parser") not in (PARSER_NAME, PARSER_ALIAS):
+        return
+
+    targets = (self, getattr(self, "online_renderer", None))
+    for target in targets:
+        if target is None:
+            continue
+        defaults = getattr(target, "default_chat_template_kwargs", None)
+        if defaults is None:
+            defaults = {}
+            target.default_chat_template_kwargs = defaults
+        defaults.setdefault("enable_thinking", True)
+
+
+_serving_chat_init_xing4_1._xing4_1_patch = True
+
+
+def _patch_serving_chat_default_thinking() -> None:
+    """Default Xing-family chat serving to thinking-enabled prompts."""
+    global _ORIG_SERVING_CHAT_INIT
+    try:
+        from vllm.entrypoints.openai.chat_completion.serving import (
+            OpenAIServingChat,
+        )
+    except ImportError:
+        # Compatibility with vLLM versions before the chat-completion package
+        # was split into its own module.
+        from vllm.entrypoints.openai.serving_chat import OpenAIServingChat
+
+    current = OpenAIServingChat.__dict__.get("__init__")
+    if getattr(current, "_xing4_1_patch", False):
+        return
+    _ORIG_SERVING_CHAT_INIT = current
+    OpenAIServingChat.__init__ = _serving_chat_init_xing4_1
+
+
 def _patch_speculative_config() -> None:
     """Teach SpeculativeConfig about Xing4.1 MTP draft configs."""
     global _ORIG_HF_CONFIG_OVERRIDE
@@ -324,6 +374,7 @@ def register() -> None:
     _register_config()
     _register_reasoning_parser()
     _register_tool_parser()
+    _patch_serving_chat_default_thinking()
     _patch_speculative_config()
     _patch_model_arch_convertor()
     _patch_deepseek_rope_forward()
