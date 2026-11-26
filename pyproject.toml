@@ -19,6 +19,7 @@ test = ["pytest>=8.0"]
 
 [project.entry-points."vllm.general_plugins"]
 xing4_0 = "vllm_xing4_0_plugin:register"
+xing4_1_preview = "vllm_xing4_0_plugin.xing4_1_preview:register"
 
 [tool.setuptools.packages.find]
 where = ["src"]
